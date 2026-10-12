@@ -1,6 +1,6 @@
 // Guarda la app en el teléfono para que abra al instante y sin internet.
 // Los datos no pasan por acá: van al repo privado por la API de GitHub.
-const CACHE = "kimchi-v1";
+const CACHE = "kimchi-v2";
 const ARCHIVOS = ["./", "index.html", "app.css", "app.js", "manifest.webmanifest",
   "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png"];
 
@@ -10,7 +10,7 @@ self.addEventListener("install", e => {
 
 self.addEventListener("activate", e => {
   e.waitUntil(caches.keys()
-    .then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))
+    .then(ks => Promise.all(ks.filter(k => k.startsWith("kimchi-v") && k !== CACHE).map(k => caches.delete(k))))
     .then(() => self.clients.claim()));
 });
 

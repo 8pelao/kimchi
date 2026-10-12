@@ -1,19 +1,26 @@
 "use strict";
 // Libreta de Kimchi. Los datos viven en el teléfono (localStorage) y se sincronizan
 // con data.json en un repo privado de GitHub, así Marco y Tania ven lo mismo.
+// Las fotos van como archivos en fotos/ del mismo repo y se guardan en caché en el teléfono.
 
 const REPO = { owner: "8pelao", repo: "kimchi-datos", path: "data.json" };
 const GUIA = "https://claude.ai/artifact/8p7HdoXzi1xiGj5hi6So6h";
-const K = { datos: "kimchi.datos", token: "kimchi.token", sync: "kimchi.sync" };
-const VERSION = "1.0";
+const K = { datos: "kimchi.datos", token: "kimchi.token", sync: "kimchi.sync", pend: "kimchi.fotosPendientes" };
+const VERSION = "1.1";
+const FOTOS_CACHE = "kimchi-fotos";
 
 const TIPOS = {
   consulta: "Consulta", vacuna: "Vacuna", desparasitacion: "Desparasitación", sintoma: "Síntoma",
   remedio: "Remedio", comida: "Comida", nota: "Nota", hito: "Hito",
 };
+const TIPOS_PL = {
+  sintoma: "Síntomas", consulta: "Consultas", comida: "Comida", remedio: "Remedios",
+  vacuna: "Vacunas", desparasitacion: "Desparasitaciones", nota: "Notas", hito: "Hitos",
+};
+const ORDEN_TIPOS = Object.keys(TIPOS_PL);
 const PROXIMA = { consulta: "Próximo control", vacuna: "Próxima dosis", desparasitacion: "Próxima desparasitación", remedio: "Fin del tratamiento" };
 const TIPOS_CONTACTO = { vet: "Veterinaria", guardia: "Guardia 24 h", otro: "Otro" };
-const COLS = ["contactos", "pesos", "eventos", "recordatorios"];
+const COLS = ["contactos", "pesos", "eventos", "recordatorios", "fotos"];
 const DIA = 86400000;
 
 // ---------- utilidades
@@ -54,18 +61,23 @@ function cuando(fecha) {
   if (d === -1) return "ayer";
   return d > 0 ? "en " + plural(d, "día", "días") : "hace " + plural(-d, "día", "días");
 }
+function rangoFechas(evs) {
+  const fs = evs.map(e => e.fecha).sort();
+  const a = fs[0], b = fs[fs.length - 1];
+  return a === b ? fCorta(a) : `${fCorta(a)} – ${fCorta(b)}`;
+}
 
 // ---------- datos
 function perfilBase() {
   return { nombre: "Kimchi", nacimiento: "2026-08-25", raza: "Salchicha (dachshund)", sexo: "Hembra", color: "",
-    chip: "", alimento: "", kcalKg: 4000, pesoAdulto: 5, alergias: "", notas: "", updatedAt: "" };
+    chip: "", alimento: "", kcalKg: 4000, pesoAdulto: 5, alergias: "", notas: "", fotoId: "", updatedAt: "" };
 }
-const vacio = () => ({ version: 1, perfil: perfilBase(), contactos: [], pesos: [], eventos: [], recordatorios: [] });
+const vacio = () => ({ version: 1, perfil: perfilBase(), contactos: [], pesos: [], eventos: [], recordatorios: [], fotos: [] });
 let datos = (() => {
   try { const d = JSON.parse(leer(K.datos)); if (d && d.perfil) return { ...vacio(), ...d }; } catch (e) {}
   return vacio();
 })();
-const vivos = c => datos[c].filter(x => !x.deleted);
+const vivos = c => (datos[c] || []).filter(x => !x.deleted);
 const porFechaDesc = (a, b) => b.fecha.localeCompare(a.fecha) || (b.updatedAt || "").localeCompare(a.updatedAt || "");
 const ultimoPeso = () => vivos("pesos").sort(porFechaDesc)[0];
 
@@ -81,9 +93,10 @@ function borrar(col, id) {
 function persistir() { guardar(K.datos, datos); render(); programarSync(); }
 
 // Une dos versiones: por cada registro gana la edición más reciente. Lo borrado queda marcado.
+// Lo que esta versión no conoce se conserva tal cual.
 function mezclar(a, b) {
   const pa = a.perfil || {}, pb = b.perfil || {};
-  const out = { version: 1, perfil: (pa.updatedAt || "") >= (pb.updatedAt || "") ? pa : pb };
+  const out = { ...b, ...a, version: 1, perfil: (pa.updatedAt || "") >= (pb.updatedAt || "") ? pa : pb };
   for (const c of COLS) {
     const m = new Map();
     for (const x of [...(a[c] || []), ...(b[c] || [])]) {
@@ -112,20 +125,20 @@ let token = leer(K.token) || "";
 let syncEstado = JSON.parse(leer(K.sync) || "null") || { estado: token ? "pendiente" : "sin-token" };
 let syncEnCurso = null, syncOtraVez = false, syncTimer = 0;
 
-function b64aTexto(b64) {
-  const bin = atob(b64.replace(/\s/g, ""));
-  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)));
-}
-function textoAb64(t) {
-  const bytes = new TextEncoder().encode(t);
+function bytesAb64(bytes) {
   let bin = "";
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
   return btoa(bin);
 }
-function api(method, body) {
-  return fetch(`https://api.github.com/repos/${REPO.owner}/${REPO.repo}/contents/${REPO.path}`, {
+const textoAb64 = t => bytesAb64(new TextEncoder().encode(t));
+function b64aTexto(b64) {
+  const bin = atob(b64.replace(/\s/g, ""));
+  return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0)));
+}
+function api(method, body, path = REPO.path, accept = "application/vnd.github+json") {
+  return fetch(`https://api.github.com/repos/${REPO.owner}/${REPO.repo}/contents/${path}`, {
     method, cache: "no-store",
-    headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+    headers: { Authorization: "Bearer " + token, Accept: accept, "X-GitHub-Api-Version": "2022-11-28" },
     body: body ? JSON.stringify(body) : undefined,
   });
 }
@@ -142,6 +155,7 @@ async function sincronizar() {
   if (syncEnCurso) { syncOtraVez = true; return syncEnCurso; }
   ponerEstado("sincronizando");
   syncEnCurso = (async () => {
+    await subirFotosPendientes();
     for (let intento = 0; intento < 4; intento++) {
       const r = await api("GET");
       let remoto = null, sha;
@@ -177,14 +191,92 @@ function pintarSync() {
   const e = syncEstado.estado;
   p.className = "punto" + (e === "ok" ? " ok" : e === "error" ? " err" : e === "sincronizando" ? " girando" : "");
   t.textContent = {
-    "ok": "Sincronizado", "sincronizando": "Sincronizando…", "sin-conexion": "Sin conexión",
-    "sin-token": "Solo en este teléfono", "error": "Error al sincronizar", "pendiente": "Sincronizar",
+    "ok": "Al día", "sincronizando": "Sincronizando", "sin-conexion": "Sin conexión",
+    "sin-token": "Sin conectar", "error": "Error", "pendiente": "Sincronizar",
   }[e] || "Sincronizar";
+}
+
+// ---------- fotos
+// Una foto nueva queda en la caché del teléfono y en «pendientes» hasta que se sube al repo;
+// recién ahí entra en datos.fotos, así el otro teléfono nunca pide un archivo que no existe.
+let fotosPendientes = JSON.parse(leer(K.pend) || "[]");
+const urlsFotos = new Map();
+const claveFoto = id => "foto-cache/" + id;
+const rutaFoto = id => "fotos/" + id + ".jpg";
+const guardarPendientes = () => guardar(K.pend, fotosPendientes);
+
+function todasLasFotos() {
+  const subidas = vivos("fotos").map(f => ({ ...f, pendiente: false }));
+  const ids = new Set(subidas.map(f => f.id));
+  const pend = fotosPendientes.filter(p => !ids.has(p.id)).map(p => ({ ...p, pendiente: true }));
+  return [...subidas, ...pend].sort((a, b) => a.fecha.localeCompare(b.fecha) || a.id.localeCompare(b.id));
+}
+function fotoPerfilId() {
+  const pend = fotosPendientes.filter(p => p.perfil);
+  return pend.length ? pend[pend.length - 1].id : datos.perfil.fotoId || "";
+}
+
+async function comprimir(file) {
+  const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const k = Math.min(1, 1280 / Math.max(bmp.width, bmp.height));
+  const cv = document.createElement("canvas");
+  cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+  cv.getContext("2d").drawImage(bmp, 0, 0, cv.width, cv.height);
+  return new Promise(res => cv.toBlob(res, "image/jpeg", 0.82));
+}
+
+async function urlFoto(id) {
+  if (urlsFotos.has(id)) return urlsFotos.get(id);
+  let blob = null;
+  try {
+    const c = await caches.open(FOTOS_CACHE);
+    const r = await c.match(claveFoto(id));
+    if (r) blob = await r.blob();
+    else if (token && navigator.onLine && vivos("fotos").some(f => f.id === id)) {
+      const resp = await api("GET", null, rutaFoto(id), "application/vnd.github.raw+json");
+      if (!resp.ok) return null;
+      blob = await resp.blob();
+      await c.put(claveFoto(id), new Response(blob, { headers: { "Content-Type": "image/jpeg" } }));
+    }
+  } catch (e) { return null; }
+  if (!blob) return null;
+  const url = URL.createObjectURL(blob);
+  urlsFotos.set(id, url);
+  return url;
+}
+
+function pintarFotos() {
+  document.querySelectorAll("img[data-foto]").forEach(async img => {
+    const url = await urlFoto(img.dataset.foto);
+    if (url && img.isConnected) { img.src = url; img.closest(".foto-marco")?.classList.add("cargada"); }
+  });
+}
+
+async function subirFotosPendientes() {
+  for (const p of [...fotosPendientes]) {
+    const c = await caches.open(FOTOS_CACHE);
+    const r = await c.match(claveFoto(p.id));
+    if (!r) { fotosPendientes = fotosPendientes.filter(x => x.id !== p.id); guardarPendientes(); continue; }
+    const bytes = new Uint8Array(await (await r.blob()).arrayBuffer());
+    const put = await api("PUT", { message: "Foto de " + (datos.perfil.nombre || "Kimchi"), content: bytesAb64(bytes) }, rutaFoto(p.id));
+    if (!put.ok && put.status !== 422) throw new Error("No se pudo subir una foto (GitHub respondió " + put.status + ").");
+    cambiar("fotos", { id: p.id, fecha: p.fecha, nota: p.nota || "" }); // 422 = ya estaba subida
+    if (p.perfil) datos.perfil = { ...datos.perfil, fotoId: p.id, updatedAt: ahora() };
+    fotosPendientes = fotosPendientes.filter(x => x.id !== p.id);
+    guardarPendientes(); guardar(K.datos, datos);
+  }
+}
+
+async function borrarArchivoFoto(id) {
+  try {
+    const r = await api("GET", null, rutaFoto(id));
+    if (r.ok) { const j = await r.json(); await api("DELETE", { message: "Borrar foto", sha: j.sha }, rutaFoto(id)); }
+  } catch (e) {}
 }
 
 // ---------- navegación
 let vista = new URLSearchParams(location.search).get("vista") || "inicio";
-let filtro = "todos";
+let filtro = "todos", modoHist = "resumen";
 function irA(v, apilar = true) {
   if (v === vista) { scrollTo(0, 0); return; }
   vista = v;
@@ -205,12 +297,16 @@ function render() {
   $("#nombre").textContent = p.nombre || "Kimchi";
   const e = edad(p.nacimiento);
   $("#edad").textContent = e.dias >= 0
-    ? edadTexto(p.nacimiento) + (e.meses < 4 ? " · " + plural(e.semanas, "semana", "semanas") + (e.resto ? " y " + plural(e.resto, "día", "días") : "") : "")
+    ? edadTexto(p.nacimiento) + (e.meses < 4 ? " · " + e.semanas + " sem" + (e.resto ? " y " + plural(e.resto, "día", "días") : "") : "")
     : "";
+  const fid = fotoPerfilId(), av = $("#avatar");
+  av.hidden = !fid;
+  if (fid && av.dataset.foto !== fid) { av.dataset.foto = fid; av.removeAttribute("src"); }
   document.querySelectorAll(".tabs button").forEach(b => b.setAttribute("aria-current", b.dataset.tab === vista ? "page" : "false"));
   const pant = { inicio, peso, historial, avisos, ficha, vet }[vista] || inicio;
   $("#vista").innerHTML = pant();
   pintarSync();
+  pintarFotos();
 }
 
 function tarjetaRacion() {
@@ -242,16 +338,16 @@ function itemAviso(r) {
   </div>`;
 }
 
-function itemEvento(ev, conEditar = true) {
-  return `<div class="item">
-    <div class="item-cuerpo">
-      <div class="fila" style="gap:8px"><span class="pill t-${ev.tipo}">${TIPOS[ev.tipo] || "Nota"}</span><span class="item-meta num">${fCorta(ev.fecha)}</span></div>
-      <span class="item-titulo">${esc(ev.titulo)}</span>
-      ${ev.detalle ? `<span class="item-detalle">${esc(ev.detalle)}</span>` : ""}
-      ${ev.proxima ? `<span class="item-meta">${PROXIMA[ev.tipo] || "Próxima"}: ${fCorta(ev.proxima)}</span>` : ""}
+// Un registro en una sola línea; al tocarlo se despliega el detalle.
+function lineaEvento(ev, conTipo = true) {
+  return `<details class="linea">
+    <summary>${conTipo ? `<span class="pill t-${ev.tipo}">${TIPOS[ev.tipo] || "Nota"}</span>` : ""}<span class="linea-fecha num">${fCorta(ev.fecha)}</span><span class="linea-titulo">${esc(ev.titulo)}</span></summary>
+    <div class="linea-cuerpo">
+      ${ev.detalle ? `<p class="item-detalle">${esc(ev.detalle)}</p>` : ""}
+      ${ev.proxima ? `<p class="item-meta">${PROXIMA[ev.tipo] || "Próxima"}: ${fCorta(ev.proxima)}</p>` : ""}
+      <button class="editar" style="justify-self:start;padding-left:0" data-accion="editar-evento" data-id="${ev.id}">Editar</button>
     </div>
-    ${conEditar ? `<button class="editar" data-accion="editar-evento" data-id="${ev.id}">Editar</button>` : ""}
-  </div>`;
+  </details>`;
 }
 
 function pendientes() {
@@ -272,6 +368,7 @@ function inicio() {
       <span class="etiqueta">Agregar</span>
       <div class="rapidos">
         <button class="rapido" data-accion="nuevo-peso"><i class="t-peso"></i>Peso</button>
+        <button class="rapido" data-accion="agregar-foto"><i class="t-comida"></i>Foto</button>
         ${["sintoma", "consulta", "vacuna", "desparasitacion", "remedio", "comida", "nota"].map(t =>
           `<button class="rapido" data-accion="nuevo-evento" data-tipo="${t}"><i class="t-${t}"></i>${t === "desparasitacion" ? "Desparasitar" : TIPOS[t]}</button>`).join("")}
         <button class="rapido" data-accion="nuevo-aviso"><i class="t-hito"></i>Aviso</button>
@@ -282,14 +379,14 @@ function inicio() {
       ${prox.length ? `<div class="lista">${prox.map(itemAviso).join("")}</div>` : `<p class="vacio">No hay avisos pendientes.</p>`}
     </div>
     <div class="card">
-      <div class="entre"><span class="etiqueta">Peso</span><button class="editar" data-accion="ir" data-vista="peso">Ver curva</button></div>
+      <div class="entre"><span class="etiqueta">Peso</span><button class="editar" data-accion="ir" data-vista="peso">Ver crecimiento</button></div>
       ${ult ? `<div class="grande num">${kgTxt(ult.kg)}</div><p class="small muted">${fLarga(ult.fecha)} · ${cuando(ult.fecha)}</p>` : `<p class="vacio">Todavía no hay pesos anotados.</p>`}
       ${hacePeso !== null && hacePeso >= 7 ? `<p class="aviso-banda">Pasó una semana: toca pesarla.</p>` : ""}
     </div>
     ${tarjetaRacion()}
     <div class="card">
       <div class="entre"><span class="etiqueta">Últimos registros</span><button class="editar" data-accion="ir" data-vista="historial">Historial</button></div>
-      ${ult5.length ? `<div class="lista">${ult5.map(e => itemEvento(e)).join("")}</div>` : `<p class="vacio">Acá van a aparecer las consultas, síntomas y notas.</p>`}
+      ${ult5.length ? `<div class="lista">${ult5.map(e => lineaEvento(e)).join("")}</div>` : `<p class="vacio">Acá van a aparecer las consultas, síntomas y notas.</p>`}
     </div>
     <button class="btn primario ancho" data-accion="ir" data-vista="vet">Resumen para el veterinario</button>
     ${vet && vet.telefono ? `<a class="btn ancho" href="tel:${esc(vet.telefono.replace(/[^\d+]/g, ""))}">Llamar a ${esc(vet.nombre || "la veterinaria")}</a>` : ""}
@@ -325,6 +422,19 @@ function grafico(pesos, nac) {
   </svg></div>`;
 }
 
+function galeria() {
+  const fotos = todasLasFotos(), nac = datos.perfil.nacimiento;
+  return `<div class="card">
+    <div class="entre"><span class="etiqueta">Fotos${fotos.length ? " (" + fotos.length + ")" : ""}</span>${fotos.length ? `<span class="small muted">de chiquita a hoy</span>` : ""}</div>
+    ${fotos.length ? `<div class="galeria">${fotos.map(f => `<button class="foto-marco" data-accion="ver-foto" data-id="${f.id}" aria-label="Foto del ${fLarga(f.fecha)}">
+        <img data-foto="${f.id}" alt="">
+        <span class="foto-pie num">${edadTexto(nac, f.fecha) || fCorta(f.fecha)}${f.pendiente ? " · sin subir" : ""}</span>
+      </button>`).join("")}</div>`
+      : `<p class="vacio">Sumá fotos para ver cómo va creciendo. Cada foto queda con la edad que tenía.</p>`}
+    <button class="btn ancho" data-accion="agregar-foto">Agregar foto</button>
+  </div>`;
+}
+
 function peso() {
   const lista = vivos("pesos").sort(porFechaDesc);
   const nac = datos.perfil.nacimiento;
@@ -341,9 +451,10 @@ function peso() {
       ${lista.length ? grafico(lista, nac) : ""}
       <button class="btn primario ancho" data-accion="nuevo-peso">Anotar peso</button>
     </div>
+    ${galeria()}
     ${tarjetaRacion()}
     <div class="card">
-      <span class="etiqueta">Registro</span>
+      <span class="etiqueta">Registro de peso</span>
       ${lista.length ? `<div class="lista">${lista.map(p => `<div class="item">
         <div class="item-cuerpo"><span class="item-titulo num">${kgTxt(p.kg)}</span>
         <span class="item-meta num">${fLarga(p.fecha)} · ${edadTexto(nac, p.fecha)}</span>
@@ -355,21 +466,40 @@ function peso() {
 
 function historial() {
   const todos = vivos("eventos").sort(porFechaDesc);
-  const tipos = [...new Set(todos.map(e => e.tipo))];
+  const tipos = ORDEN_TIPOS.filter(t => todos.some(e => e.tipo === t));
+  const selector = `<div class="segmentos" role="group" aria-label="Vista">
+    <button data-accion="modo-hist" data-modo="resumen" aria-pressed="${modoHist === "resumen"}">Resumen</button>
+    <button data-accion="modo-hist" data-modo="todo" aria-pressed="${modoHist === "todo"}">Todo</button>
+  </div>`;
+  const agregar = `<button class="btn primario ancho" data-accion="nuevo-evento" data-tipo="nota">Agregar registro</button>`;
+  if (!todos.length) return agregar + `<div class="card"><p class="vacio">Todavía no hay registros.</p></div>`;
+
+  if (modoHist === "resumen") {
+    return agregar + selector + tipos.map(t => {
+      const evs = todos.filter(e => e.tipo === t);
+      return `<div class="card">
+        <div class="entre">
+          <span class="fila" style="gap:8px"><span class="pill t-${t}">${TIPOS_PL[t]}</span><span class="small muted num">${plural(evs.length, "registro", "registros")} · ${rangoFechas(evs)}</span></span>
+          ${evs.length > 3 ? `<button class="editar" data-accion="ver-tipo" data-tipo="${t}">Ver ${evs.length}</button>` : ""}
+        </div>
+        <div class="lista">${evs.slice(0, 3).map(e => lineaEvento(e, false)).join("")}</div>
+      </div>`;
+    }).join("");
+  }
+
   const lista = filtro === "todos" ? todos : todos.filter(e => e.tipo === filtro);
   let html = "", mesActual = "";
   for (const ev of lista) {
     const mes = aFecha(ev.fecha).toLocaleDateString("es-AR", { month: "long", year: "numeric" });
     if (mes !== mesActual) { html += `<div class="mes">${mes}</div>`; mesActual = mes; }
-    html += itemEvento(ev);
+    html += lineaEvento(ev);
   }
-  return `
-    <button class="btn primario ancho" data-accion="nuevo-evento" data-tipo="nota">Agregar registro</button>
+  return agregar + selector + `
     ${tipos.length > 1 ? `<div class="filtros" role="group" aria-label="Filtrar">
       <button data-accion="filtro" data-tipo="todos" aria-pressed="${filtro === "todos"}">Todos</button>
-      ${tipos.map(t => `<button data-accion="filtro" data-tipo="${t}" aria-pressed="${filtro === t}">${TIPOS[t]}</button>`).join("")}
+      ${tipos.map(t => `<button data-accion="filtro" data-tipo="${t}" aria-pressed="${filtro === t}">${TIPOS_PL[t]}</button>`).join("")}
     </div>` : ""}
-    <div class="card">${lista.length ? `<div class="lista">${html}</div>` : `<p class="vacio">Todavía no hay registros${filtro !== "todos" ? " de este tipo" : ""}.</p>`}</div>`;
+    <div class="card">${lista.length ? `<div class="lista">${html}</div>` : `<p class="vacio">No hay registros de este tipo.</p>`}</div>`;
 }
 
 function avisos() {
@@ -386,12 +516,13 @@ function avisos() {
 }
 
 function ficha() {
-  const p = datos.perfil;
+  const p = datos.perfil, fid = fotoPerfilId();
   const contactos = vivos("contactos").sort((a, b) => Object.keys(TIPOS_CONTACTO).indexOf(a.tipo) - Object.keys(TIPOS_CONTACTO).indexOf(b.tipo));
   const fila = (k, v) => v ? `<dt>${k}</dt><dd>${esc(v)}</dd>` : "";
   return `
     <div class="card">
       <div class="entre"><span class="etiqueta">Datos</span><button class="editar" data-accion="editar-perfil">Editar</button></div>
+      ${fid ? `<div class="foto-perfil foto-marco"><img data-foto="${fid}" alt="Foto de ${esc(p.nombre)}"></div>` : `<button class="btn chico" style="justify-self:start" data-accion="agregar-foto" data-perfil="1">Poner foto de perfil</button>`}
       <dl class="datos">
         ${fila("Nombre", p.nombre)}${fila("Raza", p.raza)}${fila("Sexo", p.sexo)}
         ${fila("Nació", p.nacimiento ? fLarga(p.nacimiento) + " (" + edadTexto(p.nacimiento) + ")" : "")}
@@ -444,7 +575,7 @@ function ficha() {
         <label class="btn chico" for="importar">Restaurar copia</label>
         <input id="importar" type="file" accept="application/json,.json" hidden>
       </div>
-      <p class="small muted">Restaurar une la copia con lo que ya hay; no borra nada.</p>
+      <p class="small muted">La copia lleva los datos; las fotos quedan guardadas en GitHub. Restaurar une la copia con lo que ya hay y no borra nada.</p>
     </div>
     ${instalable && !enApp() ? `<button class="btn ancho" data-accion="instalar">Instalar en la pantalla de inicio</button>` : ""}
     <a class="btn ancho" href="${GUIA}" target="_blank" rel="noopener">Guía de cuidados</a>
@@ -459,7 +590,7 @@ function waNumero(tel) {
 }
 
 function vet() {
-  const p = datos.perfil;
+  const p = datos.perfil, fid = fotoPerfilId();
   const pesos = vivos("pesos").sort(porFechaDesc);
   const ev = vivos("eventos").sort(porFechaDesc);
   const vac = ev.filter(e => e.tipo === "vacuna"), desp = ev.filter(e => e.tipo === "desparasitacion");
@@ -473,8 +604,10 @@ function vet() {
       <button class="btn chico" data-accion="imprimir">Guardar PDF</button>
     </div>
     <div class="card">
-      <h2>${esc(p.nombre || "Kimchi")} · resumen de salud</h2>
-      <p class="small muted">Al ${fLarga(hoyISO())}</p>
+      <div class="fila" style="gap:14px;flex-wrap:nowrap">
+        ${fid ? `<div class="foto-mini foto-marco"><img data-foto="${fid}" alt=""></div>` : ""}
+        <div><h2>${esc(p.nombre || "Kimchi")} · resumen de salud</h2><p class="small muted">Al ${fLarga(hoyISO())}</p></div>
+      </div>
       <dl class="datos">
         <dt>Raza</dt><dd>${esc(p.raza)}</dd><dt>Sexo</dt><dd>${esc(p.sexo)}</dd>
         <dt>Nació</dt><dd>${fLarga(p.nacimiento)} (${edadTexto(p.nacimiento)})</dd>
@@ -511,8 +644,9 @@ function abrirHoja(html) {
   h.innerHTML = html;
   h.showModal();
   history.pushState({ vista, hoja: true }, "");
-  const primero = h.querySelector("input:not([type=hidden]), select, textarea");
+  const primero = h.querySelector("input:not([type=hidden]):not([type=checkbox]), select, textarea");
   if (primero && !primero.value) primero.focus();
+  pintarFotos();
 }
 function cerrarHoja() { const h = $("#hoja"); if (h.open) { h.close(); if (history.state?.hoja) history.back(); } }
 $("#hoja").addEventListener("cancel", e => { e.preventDefault(); cerrarHoja(); });
@@ -521,6 +655,7 @@ $("#hoja").addEventListener("click", e => { if (e.target.id === "hoja") cerrarHo
 const campo = (id, label, input, ayuda = "") => `<div class="campo"><label for="${id}">${label}</label>${input}${ayuda ? `<span class="ayuda">${ayuda}</span>` : ""}</div>`;
 const inp = (id, v = "", extra = "") => `<input id="${id}" name="${id}" value="${esc(v)}" ${extra}>`;
 const area = (id, v = "", extra = "") => `<textarea id="${id}" name="${id}" ${extra}>${esc(v)}</textarea>`;
+const casilla = (id, label, marcada) => `<label class="casilla"><input type="checkbox" id="${id}" name="${id}" ${marcada ? "checked" : ""}> ${label}</label>`;
 const botones = (borrable) => `<div class="acciones">
   ${borrable ? `<button class="btn peligro" type="button" data-accion="borrar">Borrar</button>` : ""}
   <div class="derecha"><button class="btn" type="button" data-accion="cerrar">Cancelar</button><button class="btn primario" type="submit">Guardar</button></div></div>`;
@@ -534,7 +669,7 @@ function hojaEvento(ev) {
       ${campo("tipo", "Tipo", `<select id="tipo" name="tipo">${Object.entries(TIPOS).map(([k, v]) => `<option value="${k}" ${k === tipoSel ? "selected" : ""}>${v}</option>`).join("")}</select>`)}
       ${campo("fecha", "Fecha", inp("fecha", ev.fecha || hoyISO(), 'type="date" required'))}
     </div>
-    ${campo("titulo", "Qué pasó", inp("titulo", ev.titulo, 'required maxlength="120" placeholder="Ej.: Diarrea, vacuna séxtuple, control…"'))}
+    ${campo("titulo", "Qué pasó", inp("titulo", ev.titulo, 'required maxlength="120" placeholder="Ej.: Diarrea, vacuna séxtuple, control…"'), "Corto: es lo que se ve en la lista.")}
     ${campo("detalle", "Detalles", area("detalle", ev.detalle, 'placeholder="Qué dijo el vet, dosis, cómo estaba, etc."'))}
     <div id="proxCampo" ${PROXIMA[tipoSel] ? "" : "hidden"}>
       ${campo("proxima", "Próxima fecha (opcional)", inp("proxima", ev.proxima, 'type="date"'), "Crea un aviso automático para ese día.")}
@@ -596,8 +731,46 @@ function hojaPerfil() {
   </form>`);
 }
 
+// Foto nueva: se elige del teléfono (cámara o galería) y se completa fecha y nota.
+let archivoFoto = null, fotoParaPerfil = false;
+function elegirFoto(paraPerfil) {
+  fotoParaPerfil = !!paraPerfil;
+  const input = document.createElement("input");
+  input.type = "file"; input.accept = "image/*";
+  input.addEventListener("change", () => { if (input.files[0]) hojaFotoNueva(input.files[0]); });
+  input.click();
+}
+function hojaFotoNueva(file) {
+  archivoFoto = file;
+  const nac = datos.perfil.nacimiento, f = iso(new Date(file.lastModified || Date.now()));
+  const fecha = f >= nac && f <= hoyISO() ? f : hoyISO();
+  abrirHoja(`<form class="hoja" data-form="foto-nueva">
+    <h2 id="hojaTitulo">Nueva foto</h2>
+    <img class="foto-previa" src="${URL.createObjectURL(file)}" alt="">
+    <div class="dos">
+      ${campo("fecha", "Fecha de la foto", inp("fecha", fecha, 'type="date" required'))}
+      ${campo("nota", "Nota (opcional)", inp("nota", "", 'maxlength="140" placeholder="Ej.: primer paseo"'))}
+    </div>
+    ${casilla("perfil", "Usar como foto de perfil", fotoParaPerfil || !fotoPerfilId())}
+    ${botones(false)}
+  </form>`);
+}
+function hojaFoto(f) {
+  const nac = datos.perfil.nacimiento;
+  abrirHoja(`<form class="hoja" data-form="foto" data-id="${f.id}">
+    <div class="foto-grande foto-marco"><img data-foto="${f.id}" alt="Foto del ${fLarga(f.fecha)}"></div>
+    <p><b>${edadTexto(nac, f.fecha)}</b> <span class="muted">· ${fLarga(f.fecha)}${f.pendiente ? " · todavía sin subir" : ""}</span></p>
+    <div class="dos">
+      ${campo("fecha", "Fecha", inp("fecha", f.fecha, 'type="date" required'))}
+      ${campo("nota", "Nota", inp("nota", f.nota, 'maxlength="140"'))}
+    </div>
+    ${casilla("perfil", "Foto de perfil", fotoPerfilId() === f.id)}
+    ${botones(true)}
+  </form>`);
+}
+
 // Guardar formularios
-document.addEventListener("submit", e => {
+document.addEventListener("submit", async e => {
   const f = e.target, tipo = f.dataset.form;
   if (!tipo) return;
   e.preventDefault();
@@ -636,6 +809,29 @@ document.addEventListener("submit", e => {
     datos.perfil = { ...datos.perfil, ...v, kcalKg: Number(v.kcalKg) || 0, pesoAdulto: Number(String(v.pesoAdulto).replace(",", ".")) || 5, updatedAt: ahora() };
     toast("Datos guardados");
   }
+  if (tipo === "foto-nueva") {
+    if (!archivoFoto) return;
+    const btn = f.querySelector("[type=submit]"); btn.disabled = true; btn.textContent = "Guardando…";
+    try {
+      const blob = await comprimir(archivoFoto);
+      const fid = uid();
+      await (await caches.open(FOTOS_CACHE)).put(claveFoto(fid), new Response(blob, { headers: { "Content-Type": "image/jpeg" } }));
+      fotosPendientes.push({ id: fid, fecha: v.fecha, nota: (v.nota || "").trim(), perfil: !!v.perfil });
+      guardarPendientes();
+      archivoFoto = null;
+      toast(token ? "Foto guardada; se está subiendo" : "Foto guardada en este teléfono");
+    } catch (err) { btn.disabled = false; btn.textContent = "Guardar"; return toast("No se pudo guardar la foto"); }
+  }
+  if (tipo === "foto") {
+    const pend = fotosPendientes.find(x => x.id === id);
+    if (pend) { Object.assign(pend, { fecha: v.fecha, nota: (v.nota || "").trim(), perfil: !!v.perfil }); guardarPendientes(); }
+    else {
+      cambiar("fotos", { ...datos.fotos.find(x => x.id === id), fecha: v.fecha, nota: (v.nota || "").trim() });
+      const esPerfil = datos.perfil.fotoId === id;
+      if (!!v.perfil !== esPerfil) datos.perfil = { ...datos.perfil, fotoId: v.perfil ? id : "", updatedAt: ahora() };
+    }
+    toast("Foto actualizada");
+  }
   cerrarHoja();
   persistir();
 });
@@ -651,6 +847,8 @@ document.addEventListener("click", async e => {
     case "ir": return irA(t.dataset.vista);
     case "sync": return token ? sincronizar() : irA("ficha");
     case "filtro": filtro = t.dataset.tipo; return render();
+    case "modo-hist": modoHist = t.dataset.modo; filtro = "todos"; return render();
+    case "ver-tipo": modoHist = "todo"; filtro = t.dataset.tipo; render(); return scrollTo(0, 0);
     case "nuevo-evento": return hojaEvento({ tipo: t.dataset.tipo });
     case "editar-evento": return hojaEvento(datos.eventos.find(x => x.id === id));
     case "nuevo-peso": return hojaPeso({});
@@ -660,6 +858,8 @@ document.addEventListener("click", async e => {
     case "nuevo-contacto": return hojaContacto({});
     case "editar-contacto": return hojaContacto(datos.contactos.find(x => x.id === id));
     case "editar-perfil": return hojaPerfil();
+    case "agregar-foto": return elegirFoto(t.dataset.perfil);
+    case "ver-foto": return hojaFoto(todasLasFotos().find(x => x.id === id));
     case "cerrar": return cerrarHoja();
     case "hecho": {
       const r = datos.recordatorios.find(x => x.id === id);
@@ -668,9 +868,20 @@ document.addEventListener("click", async e => {
     }
     case "borrar": {
       if (Date.now() - confirmarBorrado > 3000) { confirmarBorrado = Date.now(); t.textContent = "¿Seguro? Tocá de nuevo"; return; }
-      const f = t.closest("form"), col = { evento: "eventos", peso: "pesos", aviso: "recordatorios", contacto: "contactos" }[f.dataset.form];
-      borrar(col, f.dataset.id);
-      if (col === "eventos") { const r = datos.recordatorios.find(x => x.id === "r-" + f.dataset.id); if (r && !r.deleted) borrar("recordatorios", r.id); }
+      const f = t.closest("form"), fid = f.dataset.id;
+      if (f.dataset.form === "foto") {
+        if (fotosPendientes.some(x => x.id === fid)) { fotosPendientes = fotosPendientes.filter(x => x.id !== fid); guardarPendientes(); }
+        else {
+          borrar("fotos", fid);
+          if (datos.perfil.fotoId === fid) datos.perfil = { ...datos.perfil, fotoId: "", updatedAt: ahora() };
+          if (token && navigator.onLine) borrarArchivoFoto(fid);
+        }
+        caches.open(FOTOS_CACHE).then(c => c.delete(claveFoto(fid))).catch(() => {});
+      } else {
+        const col = { evento: "eventos", peso: "pesos", aviso: "recordatorios", contacto: "contactos" }[f.dataset.form];
+        borrar(col, fid);
+        if (col === "eventos") { const r = datos.recordatorios.find(x => x.id === "r-" + fid); if (r && !r.deleted) borrar("recordatorios", r.id); }
+      }
       cerrarHoja(); toast("Borrado"); return persistir();
     }
     case "compartir": {
