@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="es-AR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1F4D3A">
+<meta name="description" content="Libreta de salud de Kimchi: peso, vacunas, avisos e historial.">
+<title>Kimchi</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="top-fila">
+    <div class="top-txt">
+      <h1 id="nombre">Kimchi</h1>
+      <p id="edad" class="top-sub"></p>
+    </div>
+    <button id="syncBtn" class="sync" type="button" data-accion="sync"><span class="punto" id="syncPunto"></span><span id="syncTxt">Sin conectar</span></button>
+  </div>
+</header>
+
+<main id="vista" tabindex="-1"></main>
+
+<nav class="tabs" aria-label="Secciones">
+  <button type="button" data-tab="inicio"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11l8-7 8 7v9h-5v-6H9v6H4z"/></svg><span>Inicio</span></button>
+  <button type="button" data-tab="peso"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20h14l-2-12H7zM9 8a3 3 0 0 1 6 0"/></svg><span>Peso</span></button>
+  <button type="button" data-tab="historial"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h9"/></svg><span>Historial</span></button>
+  <button type="button" data-tab="avisos"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4zM10 20a2 2 0 0 0 4 0"/></svg><span>Avisos</span></button>
+  <button type="button" data-tab="ficha"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v13H4zM8 11a2 2 0 1 0 4 0 2 2 0 1 0-4 0M7 16c1-2 5-2 6 0M15 10h3M15 14h3"/></svg><span>Ficha</span></button>
+</nav>
+
+<dialog id="hoja" aria-labelledby="hojaTitulo"></dialog>
+<div id="toast" role="status" hidden></div>
+
+<script src="app.js" defer></script>
+</body>
+</html>
